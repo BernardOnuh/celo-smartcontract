@@ -22,13 +22,15 @@ import "../src/PredictEarn.sol";
 ///     --etherscan-api-key $CELOSCAN_API_KEY
 contract DeployPredictEarn is Script {
     function run() external returns (PredictEarn pe) {
+        address cUSD = vm.envAddress("CUSD_ADDRESS");
         address feeRecipient = vm.envAddress("FEE_RECIPIENT");
+        require(cUSD != address(0), "Deploy: CUSD_ADDRESS not set");
         require(feeRecipient != address(0), "Deploy: FEE_RECIPIENT not set");
 
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
 
         vm.startBroadcast(deployerKey);
-        pe = new PredictEarn(feeRecipient);
+        pe = new PredictEarn(cUSD, feeRecipient);
         vm.stopBroadcast();
 
         console2.log("PredictEarn deployed at:", address(pe));
