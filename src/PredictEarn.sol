@@ -1,25 +1,22 @@
-// SPDX-License-Identifier: GPL-3.0
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-library ECDSA {
-    function recover(bytes32 hash, bytes memory sig) internal pure returns (address) {
-        require(sig.length == 65, "ECDSA: bad sig length");
-        bytes32 r;
-        bytes32 s;
-        uint8   v;
-        assembly {
-            r := mload(add(sig, 32))
-            s := mload(add(sig, 64))
-            v := byte(0, mload(add(sig, 96)))
-        }
-        if (v < 27) v += 27;
-        require(v == 27 || v == 28, "ECDSA: bad v");
-        return ecrecover(
-            keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash)),
-            v, r, s
-        );
-    }
-}
+/**
+ * @title PredictEarn
+ * @notice Football prediction market on Celo using cUSD.
+ *         Supports standard pool bets and leveraged bets.
+ *         Also includes a waitlist registry.
+ *
+ * Flow:
+ *  1. Owner registers matches via registerMatch().
+ *  2. Users approve cUSD and call placeBet() or placeLeveragedBet().
+ *  3. Owner resolves matches via resolveMatch() with the winning outcome.
+ *  4. Winners call claimWinnings(); cancelled-match bettors call claimRefund().
+ *
+ * Waitlist:
+ *  - Anyone calls joinWaitlist(referralCode) to register interest.
+ *  - Owner emits events and can query the list.
+ */
 
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -28,560 +25,434 @@ interface IERC20 {
 }
 
 contract PredictEarn {
-    using ECDSA for bytes32;
 
-    address public constant CUSD_ADDRESS    = 0x765DE816845861e75A25fCA122bb6898B8B1282a;
-    IERC20  public constant cUSD            = IERC20(CUSD_ADDRESS);
+    // ────────────────────────────────────────────────────────────
+    //  Constants & immutables
+    // ────────────────────────────────────────────────────────────
 
-    uint256 public constant MIN_STAKE       = 0.5  ether;
-    uint256 public constant MAX_STAKE       = 500  ether;
-    uint256 public constant PLATFORM_FEE_BP = 250;
-    uint256 public constant MAX_LEVERAGE    = 100;
+    address public immutable owner;
+    IERC20  public immutable cUSD;
 
-    enum Outcome        { NONE, HOME, DRAW, AWAY }
-    enum MatchStatus    { OPEN, CLOSED, RESOLVED, CANCELLED }
-    enum WaitlistStatus { NONE, PENDING, APPROVED, REVOKED }
+    uint256 public constant PLATFORM_FEE_BPS = 200;   // 2%
+    uint256 public constant MIN_STAKE         = 0.5e18; // 0.5 cUSD
+    uint256 public constant MAX_LEVERAGE      = 100;
 
-    struct CreateMatchParams {
-        string  matchId;
-        string  homeTeam;
-        string  awayTeam;
-        string  league;
-        uint256 commenceTime;
-        uint256 homeOddBP;
-        uint256 drawOddBP;
-        uint256 awayOddBP;
-    }
+    // cUSD on Celo mainnet: 0x765DE816845861e75A25fCA122bb6898B8B1282a
+    // cUSD on Alfajores:    0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1
+
+    // ────────────────────────────────────────────────────────────
+    //  Enums
+    // ────────────────────────────────────────────────────────────
+
+    enum Outcome { Home, Draw, Away, Unresolved, Cancelled }
+
+    // ────────────────────────────────────────────────────────────
+    //  Structs
+    // ────────────────────────────────────────────────────────────
 
     struct Match {
-        string      matchId;
-        string      homeTeam;
-        string      awayTeam;
-        string      league;
-        uint256     commenceTime;
-        uint256     homeOddBP;
-        uint256     drawOddBP;
-        uint256     awayOddBP;
-        uint256     poolHome;
-        uint256     poolDraw;
-        uint256     poolAway;
-        Outcome     result;
-        MatchStatus status;
-        uint256     resolvedAt;
+        string  matchId;          // TheOddsAPI ID (off-chain reference)
+        string  description;      // e.g. "Man City vs Arsenal"
+        uint256 commenceTime;     // Unix timestamp — betting closes here
+        Outcome result;
+        bool    resolved;
+        bool    cancelled;
+        // Pool balances per outcome (in cUSD wei)
+        uint256 poolHome;
+        uint256 poolDraw;
+        uint256 poolAway;
+        uint256 totalPool;
     }
 
     struct Bet {
         address bettor;
-        uint256 matchIndex;
+        uint32  matchIndex;
         Outcome selection;
-        uint256 stake;
-        uint256 collateral;
-        uint256 leverage;
-        uint256 maxPayout;
+        uint256 stake;        // amount bettor intended to stake
+        uint256 collateral;   // stake * leverage (locked from bettor)
+        uint8   leverage;     // 1 = standard
         bool    claimed;
-        bool    isLeveraged;
     }
 
     struct WaitlistEntry {
-        address        wallet;
-        uint256        registeredAt;
-        uint256        approvedAt;
-        WaitlistStatus status;
+        address wallet;
+        string  email;          // optional — bettor can pass "" for privacy
+        string  referralCode;   // optional referral
+        uint256 registeredAt;
     }
 
-    struct MatchInfoView {
-        string  matchId;
-        string  homeTeam;
-        string  awayTeam;
-        string  league;
-        uint256 commenceTime;
-    }
+    // ────────────────────────────────────────────────────────────
+    //  State
+    // ────────────────────────────────────────────────────────────
 
-    struct MatchStateView {
-        uint256     homeOddBP;
-        uint256     drawOddBP;
-        uint256     awayOddBP;
-        uint256     poolHome;
-        uint256     poolDraw;
-        uint256     poolAway;
-        Outcome     result;
-        MatchStatus status;
-        uint256     resolvedAt;
-    }
+    Match[]          public matches;
+    Bet[]            public bets;
+    WaitlistEntry[]  public waitlist;
 
-    struct BetView {
-        address bettor;
-        uint256 matchIndex;
-        Outcome selection;
-        uint256 stake;
-        uint256 collateral;
-        uint256 leverage;
-        uint256 maxPayout;
-        bool    claimed;
-        bool    isLeveraged;
-    }
+    /// matchId (string) → on-chain index + 1  (0 means not registered)
+    mapping(string => uint256)  public matchIdToIndex;
 
-    // ── State ─────────────────────────────────────────────────────────────────
-    address public admin;
-    address public feeRecipient;
+    /// bettor → list of bet indices
+    mapping(address => uint256[]) public userBets;
 
-    Match[] public matches;
-    Bet[]   public bets;
+    /// bettor → waitlist slot + 1  (0 means not registered)
+    mapping(address => uint256)   public waitlistSlot;
 
-    mapping(uint256 => mapping(address => uint256[])) public userBetsForMatch;
-    mapping(address => uint256[])                     public userBets;
+    uint256 public collectedFees;
 
-    uint256 public totalFeesCollected;
-    bool    public waitlistGatingEnabled;
+    // ────────────────────────────────────────────────────────────
+    //  Events
+    // ────────────────────────────────────────────────────────────
 
-    mapping(address => WaitlistEntry) private _waitlist;
-    mapping(address => bytes)         private _signatures;
-    mapping(address => bytes32)       private _messageHashes;
-
-    address[]                   public waitlistAddresses;
-    mapping(address => uint256) public waitlistNonce;
-
-    // ── Events ────────────────────────────────────────────────────────────────
-    event MatchCreated(uint256 indexed matchIndex);
-    event MatchClosed(uint256 indexed matchIndex);
-    event MatchResolved(uint256 indexed matchIndex, Outcome result);
-    event MatchCancelled(uint256 indexed matchIndex);
-    event BetPlaced(
-        uint256 indexed betIndex,
-        uint256 indexed matchIndex,
-        address indexed bettor,
-        Outcome selection,
-        uint256 stake,
-        uint256 collateral,
-        uint256 leverage,
-        uint256 maxPayout
-    );
+    event MatchRegistered(uint256 indexed matchIndex, string matchId, string description, uint256 commenceTime);
+    event BetPlaced(uint256 indexed betIndex, address indexed bettor, uint32 matchIndex, Outcome selection, uint256 collateral, uint8 leverage);
+    event MatchResolved(uint32 indexed matchIndex, Outcome result);
+    event MatchCancelled(uint32 indexed matchIndex);
     event WinningsClaimed(uint256 indexed betIndex, address indexed bettor, uint256 payout);
-    event RefundClaimed(uint256 indexed betIndex, address indexed bettor, uint256 amount);
-    event AdminTransferred(address indexed oldAdmin, address indexed newAdmin);
-    event WaitlistRegistered(address indexed wallet, uint256 nonce, uint256 position);
-    event WaitlistApproved(address indexed wallet, address indexed approvedBy);
-    event WaitlistRevoked(address indexed wallet, address indexed revokedBy);
-    event WaitlistGatingChanged(bool enabled);
+    event RefundClaimed(uint256 indexed betIndex, address indexed bettor, uint256 refund);
+    event FeeWithdrawn(address indexed to, uint256 amount);
+    event WaitlistJoined(address indexed wallet, uint256 slot, string referralCode);
 
-    modifier onlyAdmin() {
-        require(msg.sender == admin, "PredictEarn: not admin");
+    // ────────────────────────────────────────────────────────────
+    //  Modifiers
+    // ────────────────────────────────────────────────────────────
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
         _;
     }
 
-    modifier matchExists(uint256 idx) {
-        require(idx < matches.length, "PredictEarn: invalid match");
+    modifier validMatch(uint32 idx) {
+        require(idx < matches.length, "Invalid match");
         _;
     }
 
-    modifier onlyApprovedOrUnrestricted() {
-        if (waitlistGatingEnabled) {
-            require(
-                _waitlist[msg.sender].status == WaitlistStatus.APPROVED,
-                "PredictEarn: not on approved waitlist"
-            );
-        }
-        _;
+    // ────────────────────────────────────────────────────────────
+    //  Constructor
+    // ────────────────────────────────────────────────────────────
+
+    constructor(address _cUSD) {
+        owner = msg.sender;
+        cUSD  = IERC20(_cUSD);
     }
 
-    constructor(address _feeRecipient) {
-        admin        = msg.sender;
-        feeRecipient = _feeRecipient;
-    }
+    // ════════════════════════════════════════════════════════════
+    //  ADMIN — Match management
+    // ════════════════════════════════════════════════════════════
 
-    // ═════════════════════════════════════════════════════════════════════════
-    //  WAITLIST — USER
-    // ═════════════════════════════════════════════════════════════════════════
+    /**
+     * @notice Register a new match. Can be called any time before betting closes.
+     * @param matchId       TheOddsAPI game ID (string key used by front-end)
+     * @param description   Human-readable label, e.g. "Arsenal vs Chelsea"
+     * @param commenceTime  Unix timestamp when the match starts (betting closes)
+     */
+    function registerMatch(
+        string calldata matchId,
+        string calldata description,
+        uint256 commenceTime
+    ) external onlyOwner {
+        require(matchIdToIndex[matchId] == 0, "Already registered");
+        require(commenceTime > block.timestamp, "Must be in the future");
 
-    function registerForWaitlist(bytes calldata signature) external {
-        WaitlistStatus current = _waitlist[msg.sender].status;
-        require(
-            current == WaitlistStatus.NONE || current == WaitlistStatus.REVOKED,
-            "PredictEarn: already registered"
-        );
-        require(signature.length == 65, "PredictEarn: bad signature length");
-
-        _verifySignature(signature);
-
-        uint256 nonce = waitlistNonce[msg.sender];
-        waitlistNonce[msg.sender] = nonce + 1;
-
-        if (current == WaitlistStatus.NONE) {
-            waitlistAddresses.push(msg.sender);
-        }
-
-        _waitlist[msg.sender] = WaitlistEntry({
-            wallet:       msg.sender,
-            registeredAt: block.timestamp,
-            approvedAt:   0,
-            status:       WaitlistStatus.PENDING
-        });
-
-        _signatures[msg.sender] = signature;
-
-        emit WaitlistRegistered(msg.sender, nonce, waitlistAddresses.length);
-    }
-
-    function _verifySignature(bytes calldata signature) private {
-        uint256 nonce = waitlistNonce[msg.sender];
-        uint256 chainId;
-        assembly { chainId := chainid() }
-
-        bytes32 msgHash = keccak256(
-            abi.encodePacked("PredictEarn waitlist", msg.sender, nonce, chainId)
-        );
-
-        address recovered = msgHash.recover(signature);
-        require(recovered == msg.sender, "PredictEarn: signature mismatch");
-
-        _messageHashes[msg.sender] = msgHash;
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  WAITLIST — ADMIN
-    // ═════════════════════════════════════════════════════════════════════════
-
-    function approveWaitlist(address wallet) external onlyAdmin {
-        require(_waitlist[wallet].status == WaitlistStatus.PENDING, "PredictEarn: not pending");
-        _waitlist[wallet].status     = WaitlistStatus.APPROVED;
-        _waitlist[wallet].approvedAt = block.timestamp;
-        emit WaitlistApproved(wallet, msg.sender);
-    }
-
-    function approveWaitlistBatch(address[] calldata wallets) external onlyAdmin {
-        for (uint256 i = 0; i < wallets.length; i++) {
-            if (_waitlist[wallets[i]].status == WaitlistStatus.PENDING) {
-                _waitlist[wallets[i]].status     = WaitlistStatus.APPROVED;
-                _waitlist[wallets[i]].approvedAt = block.timestamp;
-                emit WaitlistApproved(wallets[i], msg.sender);
-            }
-        }
-    }
-
-    function revokeWaitlist(address wallet) external onlyAdmin {
-        WaitlistStatus s = _waitlist[wallet].status;
-        require(
-            s == WaitlistStatus.APPROVED || s == WaitlistStatus.PENDING,
-            "PredictEarn: nothing to revoke"
-        );
-        _waitlist[wallet].status = WaitlistStatus.REVOKED;
-        emit WaitlistRevoked(wallet, msg.sender);
-    }
-
-    function setWaitlistGating(bool enabled) external onlyAdmin {
-        waitlistGatingEnabled = enabled;
-        emit WaitlistGatingChanged(enabled);
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  WAITLIST — VIEWS
-    // ═════════════════════════════════════════════════════════════════════════
-
-    function getWaitlistEntry(address wallet)       external view returns (WaitlistEntry memory) { return _waitlist[wallet]; }
-    function getWaitlistSignature(address wallet)   external view returns (bytes memory)         { return _signatures[wallet]; }
-    function getWaitlistMessageHash(address wallet) external view returns (bytes32)              { return _messageHashes[wallet]; }
-    function waitlistStatusOf(address wallet)       external view returns (WaitlistStatus)       { return _waitlist[wallet].status; }
-    function waitlistLength()                       external view returns (uint256)              { return waitlistAddresses.length; }
-
-    function getWaitlistPage(uint256 offset, uint256 limit)
-        external view returns (WaitlistEntry[] memory page)
-    {
-        uint256 total = waitlistAddresses.length;
-        if (offset >= total) return page;
-        uint256 end = offset + limit > total ? total : offset + limit;
-        page = new WaitlistEntry[](end - offset);
-        for (uint256 i = offset; i < end; i++) {
-            page[i - offset] = _waitlist[waitlistAddresses[i]];
-        }
-    }
-
-    function getPendingWaitlist() external view returns (WaitlistEntry[] memory result) {
-        uint256 count;
-        for (uint256 i = 0; i < waitlistAddresses.length; i++) {
-            if (_waitlist[waitlistAddresses[i]].status == WaitlistStatus.PENDING) count++;
-        }
-        result = new WaitlistEntry[](count);
-        uint256 j;
-        for (uint256 i = 0; i < waitlistAddresses.length; i++) {
-            if (_waitlist[waitlistAddresses[i]].status == WaitlistStatus.PENDING) {
-                result[j++] = _waitlist[waitlistAddresses[i]];
-            }
-        }
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  ADMIN
-    // ═════════════════════════════════════════════════════════════════════════
-
-    function createMatch(CreateMatchParams calldata p)
-        external onlyAdmin returns (uint256 matchIndex)
-    {
-        require(p.commenceTime > block.timestamp, "PredictEarn: match already started");
-        require(
-            p.homeOddBP > 10000 && p.drawOddBP > 10000 && p.awayOddBP > 10000,
-            "PredictEarn: odds must be > 1.0"
-        );
-        matchIndex = matches.length;
+        uint256 idx = matches.length;
         matches.push(Match({
-            matchId:      p.matchId,
-            homeTeam:     p.homeTeam,
-            awayTeam:     p.awayTeam,
-            league:       p.league,
-            commenceTime: p.commenceTime,
-            homeOddBP:    p.homeOddBP,
-            drawOddBP:    p.drawOddBP,
-            awayOddBP:    p.awayOddBP,
+            matchId:      matchId,
+            description:  description,
+            commenceTime: commenceTime,
+            result:       Outcome.Unresolved,
+            resolved:     false,
+            cancelled:    false,
             poolHome:     0,
             poolDraw:     0,
             poolAway:     0,
-            result:       Outcome.NONE,
-            status:       MatchStatus.OPEN,
-            resolvedAt:   0
+            totalPool:    0
         }));
-        emit MatchCreated(matchIndex);
+
+        matchIdToIndex[matchId] = idx + 1; // store 1-indexed
+        emit MatchRegistered(idx, matchId, description, commenceTime);
     }
 
-    function closeMatch(uint256 idx) external onlyAdmin matchExists(idx) {
-        require(matches[idx].status == MatchStatus.OPEN, "PredictEarn: not open");
-        matches[idx].status = MatchStatus.CLOSED;
-        emit MatchClosed(idx);
+    /**
+     * @notice Resolve a match with the final outcome.
+     *         Must be called after commenceTime.
+     */
+    function resolveMatch(uint32 matchIndex, Outcome result) external onlyOwner validMatch(matchIndex) {
+        Match storage m = matches[matchIndex];
+        require(!m.resolved && !m.cancelled, "Already finalised");
+        require(result == Outcome.Home || result == Outcome.Draw || result == Outcome.Away, "Invalid result");
+
+        m.result   = result;
+        m.resolved = true;
+        emit MatchResolved(matchIndex, result);
     }
 
-    function resolveMatch(uint256 idx, Outcome result) external onlyAdmin matchExists(idx) {
-        Match storage m = matches[idx];
+    /**
+     * @notice Cancel a match (e.g. postponed). All bettors get full refunds.
+     */
+    function cancelMatch(uint32 matchIndex) external onlyOwner validMatch(matchIndex) {
+        Match storage m = matches[matchIndex];
+        require(!m.resolved && !m.cancelled, "Already finalised");
+        m.cancelled = true;
+        emit MatchCancelled(matchIndex);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  USER — Place bets
+    // ════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Place a standard (1x leverage) bet.
+     * @param matchId   TheOddsAPI game ID
+     * @param selection Home=0, Draw=1, Away=2
+     * @param stake     Amount in cUSD wei (≥ 0.5 cUSD)
+     */
+    function placeBet(
+        string calldata matchId,
+        Outcome selection,
+        uint256 stake
+    ) external {
+        _placeBet(matchId, selection, stake, 1);
+    }
+
+    /**
+     * @notice Place a leveraged bet. Collateral = stake × leverage.
+     *         You lose all collateral if you're wrong; payout is also multiplied.
+     * @param leverage  1–100
+     */
+    function placeLeveragedBet(
+        string calldata matchId,
+        Outcome selection,
+        uint256 stake,
+        uint8   leverage
+    ) external {
+        require(leverage >= 2 && leverage <= MAX_LEVERAGE, "Invalid leverage");
+        _placeBet(matchId, selection, stake, leverage);
+    }
+
+    function _placeBet(
+        string calldata matchId,
+        Outcome selection,
+        uint256 stake,
+        uint8   leverage
+    ) internal {
+        require(stake >= MIN_STAKE, "Stake too small");
         require(
-            m.status == MatchStatus.OPEN || m.status == MatchStatus.CLOSED,
-            "PredictEarn: already resolved or cancelled"
+            selection == Outcome.Home ||
+            selection == Outcome.Draw ||
+            selection == Outcome.Away,
+            "Invalid selection"
         );
-        require(result != Outcome.NONE,            "PredictEarn: invalid result");
-        require(block.timestamp >= m.commenceTime, "PredictEarn: match not started yet");
-        m.result     = result;
-        m.status     = MatchStatus.RESOLVED;
-        m.resolvedAt = block.timestamp;
-        emit MatchResolved(idx, result);
-    }
 
-    function cancelMatch(uint256 idx) external onlyAdmin matchExists(idx) {
-        require(matches[idx].status != MatchStatus.RESOLVED, "PredictEarn: already resolved");
-        matches[idx].status = MatchStatus.CANCELLED;
-        emit MatchCancelled(idx);
-    }
+        uint256 idx1 = matchIdToIndex[matchId];
+        require(idx1 != 0, "Match not registered");
+        uint32 matchIndex = uint32(idx1 - 1);
 
-    function updateOdds(uint256 idx, uint256 h, uint256 d, uint256 a)
-        external onlyAdmin matchExists(idx)
-    {
-        require(matches[idx].status == MatchStatus.OPEN, "PredictEarn: not open");
-        matches[idx].homeOddBP = h;
-        matches[idx].drawOddBP = d;
-        matches[idx].awayOddBP = a;
-    }
+        Match storage m = matches[matchIndex];
+        require(!m.resolved && !m.cancelled, "Match finalised");
+        require(block.timestamp < m.commenceTime, "Betting closed");
 
-    function withdrawFees() external onlyAdmin {
-        uint256 amount = totalFeesCollected;
-        require(amount > 0, "PredictEarn: no fees");
-        totalFeesCollected = 0;
-        require(cUSD.transfer(feeRecipient, amount), "PredictEarn: fee transfer failed");
-    }
+        uint256 collateral = stake * leverage;
 
-    function transferAdmin(address newAdmin) external onlyAdmin {
-        require(newAdmin != address(0), "PredictEarn: zero address");
-        emit AdminTransferred(admin, newAdmin);
-        admin = newAdmin;
-    }
-
-    function setFeeRecipient(address r) external onlyAdmin {
-        require(r != address(0), "PredictEarn: zero address");
-        feeRecipient = r;
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  USER
-    // ═════════════════════════════════════════════════════════════════════════
-
-    function placeBet(uint256 idx, Outcome sel, uint256 stakeWei)
-        external matchExists(idx) onlyApprovedOrUnrestricted returns (uint256)
-    {
-        return _placeBet(idx, sel, stakeWei, 1);
-    }
-
-    function placeLeveragedBet(uint256 idx, Outcome sel, uint256 stakeWei, uint256 leverage)
-        external matchExists(idx) onlyApprovedOrUnrestricted returns (uint256)
-    {
-        require(leverage >= 1 && leverage <= MAX_LEVERAGE, "PredictEarn: bad leverage");
-        return _placeBet(idx, sel, stakeWei, leverage);
-    }
-
-    function claimWinnings(uint256 betIndex) external {
-        require(betIndex < bets.length,  "PredictEarn: invalid bet");
-        Bet storage bet = bets[betIndex];
-        require(bet.bettor == msg.sender, "PredictEarn: not your bet");
-        require(!bet.claimed,             "PredictEarn: already claimed");
-        require(matches[bet.matchIndex].status == MatchStatus.RESOLVED, "PredictEarn: not resolved");
-        bet.claimed = true;
-        if (bet.selection == matches[bet.matchIndex].result) {
-            uint256 fee    = (bet.maxPayout * PLATFORM_FEE_BP) / 10000;
-            uint256 payout = bet.maxPayout - fee;
-            totalFeesCollected += fee;
-            require(cUSD.transfer(msg.sender, payout), "PredictEarn: payout failed");
-            emit WinningsClaimed(betIndex, msg.sender, payout);
-        }
-    }
-
-    function claimRefund(uint256 betIndex) external {
-        require(betIndex < bets.length,  "PredictEarn: invalid bet");
-        Bet storage bet = bets[betIndex];
-        require(bet.bettor == msg.sender, "PredictEarn: not your bet");
-        require(!bet.claimed,             "PredictEarn: already claimed");
-        require(matches[bet.matchIndex].status == MatchStatus.CANCELLED, "PredictEarn: not cancelled");
-        bet.claimed = true;
-        uint256 refund = bet.collateral;
-        require(cUSD.transfer(msg.sender, refund), "PredictEarn: refund failed");
-        emit RefundClaimed(betIndex, msg.sender, refund);
-    }
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  INTERNAL
-    // ═════════════════════════════════════════════════════════════════════════
-
-    function _placeBet(uint256 idx, Outcome sel, uint256 stakeWei, uint256 leverage)
-        internal returns (uint256 betIndex)
-    {
-        uint256 maxPayout = _validateAndCollect(idx, sel, stakeWei, leverage);
-        betIndex = _recordBet(idx, sel, stakeWei, leverage, maxPayout);
-    }
-
-    function _validateAndCollect(
-        uint256 idx,
-        Outcome sel,
-        uint256 stakeWei,
-        uint256 leverage
-    ) internal returns (uint256 maxPayout) {
-        Match storage m = matches[idx];
-        require(m.status == MatchStatus.OPEN,     "PredictEarn: betting closed");
-        require(block.timestamp < m.commenceTime, "PredictEarn: match started");
-        require(sel != Outcome.NONE,              "PredictEarn: invalid selection");
-        require(stakeWei >= MIN_STAKE,            "PredictEarn: below min stake");
-        require(stakeWei <= MAX_STAKE,            "PredictEarn: above max stake");
-
-        uint256 collateral = stakeWei * leverage;
-        maxPayout = (collateral * _getOddBP(m, sel)) / 10000;
-
+        // Pull collateral from bettor
         require(
             cUSD.transferFrom(msg.sender, address(this), collateral),
-            "PredictEarn: transfer failed"
+            "Transfer failed"
         );
 
-        if      (sel == Outcome.HOME) m.poolHome += stakeWei;
-        else if (sel == Outcome.DRAW) m.poolDraw += stakeWei;
-        else                          m.poolAway += stakeWei;
-    }
+        // Add to pool
+        if      (selection == Outcome.Home) m.poolHome += collateral;
+        else if (selection == Outcome.Draw) m.poolDraw += collateral;
+        else                                m.poolAway += collateral;
+        m.totalPool += collateral;
 
-    function _recordBet(
-        uint256 idx,
-        Outcome sel,
-        uint256 stakeWei,
-        uint256 leverage,
-        uint256 maxPayout
-    ) internal returns (uint256 betIndex) {
-        uint256 collateral = stakeWei * leverage;
-        betIndex = bets.length;
+        uint256 betIndex = bets.length;
         bets.push(Bet({
-            bettor:      msg.sender,
-            matchIndex:  idx,
-            selection:   sel,
-            stake:       stakeWei,
-            collateral:  collateral,
-            leverage:    leverage,
-            maxPayout:   maxPayout,
-            claimed:     false,
-            isLeveraged: leverage > 1
+            bettor:     msg.sender,
+            matchIndex: matchIndex,
+            selection:  selection,
+            stake:      stake,
+            collateral: collateral,
+            leverage:   leverage,
+            claimed:    false
         }));
+
         userBets[msg.sender].push(betIndex);
-        userBetsForMatch[idx][msg.sender].push(betIndex);
-        emit BetPlaced(betIndex, idx, msg.sender, sel, stakeWei, collateral, leverage, maxPayout);
+        emit BetPlaced(betIndex, msg.sender, matchIndex, selection, collateral, leverage);
     }
 
-    function _getOddBP(Match storage m, Outcome sel) internal view returns (uint256) {
-        if (sel == Outcome.HOME) return m.homeOddBP;
-        if (sel == Outcome.DRAW) return m.drawOddBP;
-        return m.awayOddBP;
+    // ════════════════════════════════════════════════════════════
+    //  USER — Claim winnings / refunds
+    // ════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Claim winnings for a won bet.
+     *         Payout = (your collateral / winning-side pool) × total pool × (1 - fee)
+     */
+    function claimWinnings(uint256 betIndex) external {
+        Bet storage bet = bets[betIndex];
+        require(bet.bettor == msg.sender, "Not your bet");
+        require(!bet.claimed, "Already claimed");
+
+        Match storage m = matches[bet.matchIndex];
+        require(m.resolved, "Not resolved yet");
+        require(bet.selection == m.result, "Bet lost");
+
+        uint256 winningPool = _winningPool(m);
+        require(winningPool > 0, "Empty winning pool");
+
+        // Proportional share of total pool, minus platform fee
+        uint256 grossPayout = (bet.collateral * m.totalPool) / winningPool;
+        uint256 fee         = (grossPayout * PLATFORM_FEE_BPS) / 10_000;
+        uint256 netPayout   = grossPayout - fee;
+
+        collectedFees += fee;
+        bet.claimed = true;
+
+        require(cUSD.transfer(msg.sender, netPayout), "Transfer failed");
+        emit WinningsClaimed(betIndex, msg.sender, netPayout);
     }
 
-    // ═════════════════════════════════════════════════════════════════════════
-    //  VIEWS
-    // ═════════════════════════════════════════════════════════════════════════
+    /**
+     * @notice Claim a full refund for a bet on a cancelled match.
+     */
+    function claimRefund(uint256 betIndex) external {
+        Bet storage bet = bets[betIndex];
+        require(bet.bettor == msg.sender, "Not your bet");
+        require(!bet.claimed, "Already claimed");
 
-    function getMatchCount() external view returns (uint256) { return matches.length; }
-    function getBetCount()   external view returns (uint256) { return bets.length; }
+        Match storage m = matches[bet.matchIndex];
+        require(m.cancelled, "Match not cancelled");
 
-    function getMatchInfo(uint256 idx)
-        external view matchExists(idx) returns (MatchInfoView memory v)
+        bet.claimed = true;
+        require(cUSD.transfer(msg.sender, bet.collateral), "Transfer failed");
+        emit RefundClaimed(betIndex, msg.sender, bet.collateral);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  ADMIN — Fee withdrawal
+    // ════════════════════════════════════════════════════════════
+
+    function withdrawFees(address to) external onlyOwner {
+        uint256 amount = collectedFees;
+        require(amount > 0, "Nothing to withdraw");
+        collectedFees = 0;
+        require(cUSD.transfer(to, amount), "Transfer failed");
+        emit FeeWithdrawn(to, amount);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  WAITLIST
+    // ════════════════════════════════════════════════════════════
+
+    /**
+     * @notice Join the platform waitlist. One entry per wallet.
+     * @param email        Optional e-mail string (stored on-chain; keep privacy in mind).
+     *                     Pass "" to omit.
+     * @param referralCode Optional referral code from an existing user.
+     */
+    function joinWaitlist(string calldata email, string calldata referralCode) external {
+        require(waitlistSlot[msg.sender] == 0, "Already on waitlist");
+
+        uint256 slot = waitlist.length + 1; // 1-indexed
+        waitlist.push(WaitlistEntry({
+            wallet:       msg.sender,
+            email:        email,
+            referralCode: referralCode,
+            registeredAt: block.timestamp
+        }));
+
+        waitlistSlot[msg.sender] = slot;
+        emit WaitlistJoined(msg.sender, slot, referralCode);
+    }
+
+    /// @notice Returns true if the caller is on the waitlist.
+    function isOnWaitlist(address wallet) external view returns (bool) {
+        return waitlistSlot[wallet] != 0;
+    }
+
+    /// @notice Returns the waitlist position (1-indexed) for a wallet.
+    function getWaitlistPosition(address wallet) external view returns (uint256) {
+        return waitlistSlot[wallet];
+    }
+
+    /// @notice Total number of waitlist entries.
+    function waitlistCount() external view returns (uint256) {
+        return waitlist.length;
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  READ HELPERS
+    // ════════════════════════════════════════════════════════════
+
+    /// @notice Returns all on-chain match indices and their matchIds.
+    function getMatchCount() external view returns (uint256) {
+        return matches.length;
+    }
+
+    /// @notice Returns pool data for a match by its TheOddsAPI matchId.
+    function getPoolByMatchId(string calldata matchId)
+        external view
+        returns (uint256 home, uint256 draw, uint256 away, uint256 total)
     {
-        Match storage m = matches[idx];
-        v.matchId      = m.matchId;
-        v.homeTeam     = m.homeTeam;
-        v.awayTeam     = m.awayTeam;
-        v.league       = m.league;
-        v.commenceTime = m.commenceTime;
+        uint256 idx1 = matchIdToIndex[matchId];
+        require(idx1 != 0, "Not registered");
+        Match storage m = matches[idx1 - 1];
+        return (m.poolHome, m.poolDraw, m.poolAway, m.totalPool);
     }
 
-    function getMatchState(uint256 idx)
-        external view matchExists(idx) returns (MatchStateView memory v)
-    {
-        Match storage m = matches[idx];
-        v.homeOddBP  = m.homeOddBP;
-        v.drawOddBP  = m.drawOddBP;
-        v.awayOddBP  = m.awayOddBP;
-        v.poolHome   = m.poolHome;
-        v.poolDraw   = m.poolDraw;
-        v.poolAway   = m.poolAway;
-        v.result     = m.result;
-        v.status     = m.status;
-        v.resolvedAt = m.resolvedAt;
+    /// @notice Returns all bet indices for a given bettor.
+    function getUserBetIndices(address bettor) external view returns (uint256[] memory) {
+        return userBets[bettor];
     }
 
+    /// @notice Returns full bet data for a given index.
     function getBet(uint256 betIndex)
-        external view returns (BetView memory v)
+        external view
+        returns (
+            address bettor,
+            uint32  matchIndex,
+            Outcome selection,
+            uint256 stake,
+            uint256 collateral,
+            uint8   leverage,
+            bool    claimed
+        )
     {
-        require(betIndex < bets.length, "PredictEarn: invalid bet");
         Bet storage b = bets[betIndex];
-        v.bettor      = b.bettor;
-        v.matchIndex  = b.matchIndex;
-        v.selection   = b.selection;
-        v.stake       = b.stake;
-        v.collateral  = b.collateral;
-        v.leverage    = b.leverage;
-        v.maxPayout   = b.maxPayout;
-        v.claimed     = b.claimed;
-        v.isLeveraged = b.isLeveraged;
+        return (b.bettor, b.matchIndex, b.selection, b.stake, b.collateral, b.leverage, b.claimed);
     }
 
-    function getUserBets(address user) external view returns (uint256[] memory) {
-        return userBets[user];
-    }
-
-    function getUserBetsForMatch(uint256 idx, address user)
-        external view returns (uint256[] memory)
+    /// @notice Returns match struct fields (split to avoid stack-too-deep).
+    function getMatch(uint32 idx)
+        external view
+        returns (
+            string memory matchId,
+            string memory description,
+            uint256 commenceTime,
+            Outcome result,
+            bool resolved,
+            bool cancelled,
+            uint256 poolHome,
+            uint256 poolDraw,
+            uint256 poolAway,
+            uint256 totalPool
+        )
     {
-        return userBetsForMatch[idx][user];
+        Match storage m = matches[idx];
+        return (
+            m.matchId, m.description, m.commenceTime,
+            m.result, m.resolved, m.cancelled,
+            m.poolHome, m.poolDraw, m.poolAway, m.totalPool
+        );
     }
 
-    function getOpenMatches() external view returns (uint256[] memory indices) {
-        uint256 count;
-        for (uint256 i = 0; i < matches.length; i++) {
-            if (matches[i].status == MatchStatus.OPEN) count++;
-        }
-        indices = new uint256[](count);
-        uint256 j;
-        for (uint256 i = 0; i < matches.length; i++) {
-            if (matches[i].status == MatchStatus.OPEN) indices[j++] = i;
-        }
-    }
+    // ────────────────────────────────────────────────────────────
+    //  Internal helpers
+    // ────────────────────────────────────────────────────────────
 
-    function isBetWinner(uint256 betIndex) external view returns (bool) {
-        require(betIndex < bets.length, "PredictEarn: invalid bet");
-        Bet storage b = bets[betIndex];
-        return matches[b.matchIndex].status == MatchStatus.RESOLVED
-            && b.selection == matches[b.matchIndex].result;
+    function _winningPool(Match storage m) internal view returns (uint256) {
+        if (m.result == Outcome.Home) return m.poolHome;
+        if (m.result == Outcome.Draw) return m.poolDraw;
+        return m.poolAway;
     }
 }
