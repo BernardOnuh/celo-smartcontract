@@ -14,5 +14,4 @@ contract DeployPredictEarn is Script {
 
         console.log("PredictEarn deployed at:", address(predictearn));
     }
-    
 }
