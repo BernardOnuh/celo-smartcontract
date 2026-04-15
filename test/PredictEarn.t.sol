@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import "../src/PredictEarn.sol";
 
 contract MockERC20 is IERC20 {
+
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
@@ -24,6 +25,7 @@ contract MockERC20 is IERC20 {
 }
 
 contract PredictEarnTest is Test {
+    
     PredictEarn public predictearn;
     MockERC20   public cusd;
 
