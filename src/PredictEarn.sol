@@ -34,7 +34,7 @@ contract PredictEarn {
     address public immutable owner;
     IERC20  public immutable cUSD;
 
-    uint256 public constant PLATFORM_FEE_BPS = 200;   // 2%
+    uint256 public constant PLATFORM_FEE_BPS = 2000;   // 20%
     uint256 public constant MIN_STAKE         = 0.5e18; // 0.5 cUSD
     uint256 public constant MAX_LEVERAGE      = 100;
 
