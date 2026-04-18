@@ -40,7 +40,7 @@ contract PredictEarnTest is Test {
     function testRegisterMatch() public {
         predictearn.registerMatch(
             "match-001",
-            "Arsenal vs Chelsea",
+            "Liverpool vs Chelsea",
             block.timestamp + 1 days
         );
         assertEq(predictearn.getMatchCount(), 1);
