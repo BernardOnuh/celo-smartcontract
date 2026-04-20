@@ -14,4 +14,5 @@ contract DeployPredictEarn is Script {
         vm.stopBroadcast();
         console.log("PredictEarn deployed at:", address(predictearn));
     }
+    
 }
