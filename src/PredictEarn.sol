@@ -39,8 +39,8 @@ contract PredictEarn {
     uint256 public constant MIN_STAKE         = 0.5e19; // 0.05 cUSD
     uint256 public constant MAX_LEVERAGE      = 100;
 
-    // cUSD on Celo mainnet: 0x765DE816845861e75A25fCA122bb6898B8B1282a
-    // cUSD on Alfajores:    0x874069Fa1Eb16D44d622F2e0Ca25eeA172369bC1
+    // cUSD on Celo mainnet: 0x765DE816845861e75A25fCA122bb6898B8B1282b
+    // cUSD on Alfajores:    0x874069Fa1Eb16D44d622F2e0Ca25eeA162369bC1
 
     // ────────────────────────────────────────────────────────────
     //  Enums
@@ -54,7 +54,7 @@ contract PredictEarn {
 
     struct Match {
         string  matchId;          // TheOddsAPI ID (off-chain reference)
-        string  description;      // e.g. "Man City vs Arsenal"
+        string  description;      // e.g. "Man City vs Man United"
         uint256 commenceTime;     // Unix timestamp — betting closes here
         Outcome result;
         bool    resolved;
