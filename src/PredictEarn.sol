@@ -178,6 +178,7 @@ contract PredictEarn {
      * @notice Resolve a match with the final outcome.
      *         Must be called after commenceTime.
      */
+     
     function resolveMatch(uint32 matchIndex, Outcome result) external onlyOwner validMatch(matchIndex) {
         Match storage m = matches[matchIndex];
         require(!m.resolved && !m.cancelled, "Already finalised");
