@@ -27,7 +27,6 @@ contract MockERC20 is IERC20 {
 }
 
 contract PredictEarnTest is Test {
-    
     PredictEarn public predictearn;
     MockERC20   public cusd;
 
