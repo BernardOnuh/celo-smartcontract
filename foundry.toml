@@ -27,4 +27,4 @@ seed = "0xdead"
 # Add these lines:
 via_ir    = true
 optimizer = true
-optimizer_runs = 200
+optimizer_runs = 100
