@@ -35,9 +35,6 @@ $ forge fmt
 
 ### Gas Snapshots
 
-```shell
-$ forge snapshot
-```
 
 ### Anvil
 
