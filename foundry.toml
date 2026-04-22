@@ -10,7 +10,7 @@ remappings = [
     "@openzeppelin/=lib/openzeppelin-contracts/"
 ]
 
-verbosity = 2
+verbosity = 3
 
 [rpc_endpoints]
 celo = "${CELO_RPC_URL}"
