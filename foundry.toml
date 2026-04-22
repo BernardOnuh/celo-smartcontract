@@ -10,7 +10,7 @@ remappings = [
     "@openzeppelin/=lib/openzeppelin-contracts/"
 ]
 
-verbosity = 3
+verbosity = 2
 
 [rpc_endpoints]
 celo = "${CELO_RPC_URL}"
@@ -27,4 +27,4 @@ seed = "0xdead"
 # Add these lines:
 via_ir    = true
 optimizer = true
-optimizer_runs = 100
+optimizer_runs = 200
