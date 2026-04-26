@@ -35,9 +35,9 @@ contract PredictEarn {
     address public immutable owner;
     IERC20  public immutable cUSD;
 
-    uint256 public constant PLATFORM_FEE_BPS = 75;   // 1%
-    uint256 public constant MIN_STAKE         = 0.25e18; // 0.05 cUSD
-    uint256 public constant MAX_LEVERAGE      = 150;
+    uint256 public constant PLATFORM_FEE_BPS = 100;   // 1%
+    uint256 public constant MIN_STAKE         = 0.5e18; // 0.05 cUSD
+    uint256 public constant MAX_LEVERAGE      = 100;
 
     // cUSD on Celo mainnet: 0x765DE816845861e75A25fCA122bb6898B8B1282a
     // cUSD on Alfajores:    0x874069Fa1Eb16D44d622F2e0Ca25eeA162369bC1
