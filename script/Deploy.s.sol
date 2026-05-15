@@ -11,9 +11,9 @@ contract DeployPredictEarn is Script {
         address cUSD = vm.envAddress("CUSD_MAINNET"); 
         vm.startBroadcast();
         PredictEarn predictearn = new PredictEarn(cUSD);
-        console.log("Sample match 1: Nigeria vs Ghana");
-        console.log("Sample match 2: Egypt vs Morocco");
-        console.log("Sample match 3: Senegal vs Ivory Coast");
+        console.log("Sample match 1: Liverpool vs Tottenham");
+        console.log("Sample match 2: Newcastle vs Arsenal");
+        console.log("Sample match 3: Chelsea vs Man United");
         vm.stopBroadcast();
         console.log("PredictEarn deployed at:", address(predictearn));
     }
